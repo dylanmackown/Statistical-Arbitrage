@@ -2,27 +2,29 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 
-data = pd.read_csv("data/ko_pep.csv", index_col=0, parse_dates=True)
+from pull_data import TICKER_A, TICKER_B
+
+data = pd.read_csv(f"data/{TICKER_A}_{TICKER_B}.csv", index_col=0, parse_dates=True)
 
 # Normalize both series to start at 100, so they're comparable regardless
-# of the fact that KO and PEP trade at very different price levels
+# of the fact that Ticker A and Ticker B trade at very different price levels
 normalized = data / data.iloc[0] * 100
 
 # Simple spread: the gap between the two normalized series.
 # This isn't the "real" spread you'll use later (that comes from the
 # regression in step 4) — it's just enough to eyeball reversion.
-spread = normalized["KO"] - normalized["PEP"]
+spread = normalized[TICKER_A] - normalized[TICKER_B]
 rolling_mean = spread.rolling(60).mean()
 rolling_std = spread.rolling(60).std()
 
 fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
 
-axes[0].plot(normalized.index, normalized["KO"], label="KO")
-axes[0].plot(normalized.index, normalized["PEP"], label="PEP")
+axes[0].plot(normalized.index, normalized[TICKER_A], label=TICKER_A)
+axes[0].plot(normalized.index, normalized[TICKER_B], label=TICKER_B)
 axes[0].set_title("Normalized prices (both start at 100)")
 axes[0].legend()
 
-axes[1].plot(spread.index, spread, label="Spread (KO - PEP, normalized)", color="black")
+axes[1].plot(spread.index, spread, label=f"Spread ({TICKER_A} - {TICKER_B}, normalized)", color="black")
 axes[1].plot(rolling_mean.index, rolling_mean, label="60-day rolling mean", color="orange")
 axes[1].fill_between(
     spread.index,
@@ -35,5 +37,5 @@ axes[1].set_title("Spread")
 axes[1].legend()
 
 plt.tight_layout()
-plt.savefig("data/ko_pep_spread.png")
+plt.savefig(f"data/{TICKER_A}_{TICKER_B}_spread.png")
 plt.show()
