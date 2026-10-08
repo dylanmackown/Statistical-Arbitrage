@@ -1,18 +1,14 @@
-# plot_pair.py
-import pandas as pd
 import matplotlib.pyplot as plt
 
-from pull_data import TICKER_A, TICKER_B
+from pull_data import TICKER_A, TICKER_B, load_data
 
-data = pd.read_csv(f"data/{TICKER_A}_{TICKER_B}.csv", index_col=0, parse_dates=True)
+data = load_data(TICKER_A, TICKER_B)
 
 # Normalize both series to start at 100, so they're comparable regardless
 # of the fact that Ticker A and Ticker B trade at very different price levels
 normalized = data / data.iloc[0] * 100
 
 # Simple spread: the gap between the two normalized series.
-# This isn't the "real" spread you'll use later (that comes from the
-# regression in step 4) — it's just enough to eyeball reversion.
 spread = normalized[TICKER_A] - normalized[TICKER_B]
 rolling_mean = spread.rolling(60).mean()
 rolling_std = spread.rolling(60).std()
