@@ -1,4 +1,18 @@
+# Three ways to run it:
+#   python backtest_report.py                 screen CANDIDATES, backtest the
+#                                              single best pair (default thresholds)
+#   python backtest_report.py V MA             skip screening, force a specific pair
+#   python backtest_report.py --tune           best pair, but grid-search entry/exit
+#                                              thresholds on a train split and report
+#                                              performance out-of-sample on the rest
+#   python backtest_report.py --portfolio      backtest EVERY pair that clears the
+#                                              cointegration screen and report an
+#                                              equal-weighted portfolio across them
+#   python backtest_report.py --portfolio --tune   portfolio, each pair's thresholds
+#                                                   tuned on its own train split
+
 import sys
+import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -6,13 +20,14 @@ import matplotlib.pyplot as plt
 from pull_data import TICKER_A, TICKER_B, START_DATE, END_DATE, load_data
 from screen_pairs import CANDIDATES, screen
 from native_backtest import run_naive
-from walk_forward_backtest import run_walk_forward
+from walk_forward_backtest import run_walk_forward, grid_search_thresholds
+from performance import to_returns, perf_stats, alpha_beta, TRADING_DAYS, COST_BPS, RISK_FREE_RATE
 
-TRADING_DAYS = 252
-COST_BPS = 5.0          # one-way cost per $ notional traded, in basis points
-RISK_FREE_RATE = 0.0    # annualized, used in Sharpe/Sortino
 BENCHMARK_TICKER = "SPY"
-SIGNIFICANCE = 0.05     # p-value threshold
+SIGNIFICANCE = 0.05      # p-value threshold for "actually cointegrated"
+DEFAULT_ENTRY_Z = 2.0
+DEFAULT_EXIT_Z = 0.5
+DEFAULT_TRAIN_END = "2023-06-30"   # ~65/35 train/test split over 2020-2025
 
 
 # Pair selection
@@ -23,9 +38,7 @@ def select_best_pair(candidates=CANDIDATES, start=START_DATE, end=END_DATE,
 
     Returns (ticker_a, ticker_b, pvalue) for the lowest p-value in the
     candidate list. Prints a warning (but still proceeds) if even the best
-    candidate doesn't clear the significance threshold -- that means the
-    candidate list doesn't currently contain a statistically defensible
-    pair, and whatever gets backtested should be treated as exploratory.
+    candidate doesn't clear the significance threshold.
     """
     results = screen(candidates, start=start, end=end)
     best = results.iloc[0]
@@ -40,75 +53,6 @@ def select_best_pair(candidates=CANDIDATES, start=START_DATE, end=END_DATE,
               f"(p-value = {best['p_value']:.4f})\n"
               f"{results.to_string(index=False)}\n")
     return best["A"], best["B"], best["p_value"]
-
-
-# Returns, not raw spread P&L
-
-def to_returns(result, data, ticker_a=TICKER_A, ticker_b=TICKER_B, cost_bps=COST_BPS):
-    """Convert a backtest's raw spread P&L into daily % returns.
-
-    Divide by the gross notional required to hold the position 
-    to get a return, then subtract a simple bps-of-notional
-    transaction cost whenever the position changes.
-    """
-    notional = data[ticker_a] + result["hedge_ratio"].abs() * data[ticker_b]
-    notional = notional.reindex(result.index)
-
-    trade = result["position"].diff().abs().fillna(0)
-    cost = (cost_bps / 1e4) * notional * trade
-
-    gross_returns = result["pnl"] / notional.shift(1)
-    net_returns = (result["pnl"] - cost) / notional.shift(1)
-
-    n_trades = int(((result["position"] != 0) & (result["position"].shift(1) == 0)).sum())
-
-    return gross_returns.dropna(), net_returns.dropna(), n_trades
-
-
-# Performance statistics
-
-def perf_stats(returns, freq=TRADING_DAYS, rf=RISK_FREE_RATE):
-    returns = returns.dropna()
-    if len(returns) < 2:
-        return {k: np.nan for k in
-                ["CAGR", "AnnVol", "Sharpe", "Sortino", "MaxDD", "Calmar", "WinRate"]}
-
-    equity = (1 + returns).cumprod()
-    n_years = len(returns) / freq
-    total_return = equity.iloc[-1] - 1
-    cagr = (1 + total_return) ** (1 / n_years) - 1 if n_years > 0 else np.nan
-
-    ann_vol = returns.std() * np.sqrt(freq)
-    ann_mean = returns.mean() * freq
-    sharpe = (ann_mean - rf) / ann_vol if ann_vol > 0 else np.nan
-
-    downside = returns[returns < 0]
-    downside_vol = downside.std() * np.sqrt(freq) if len(downside) > 1 else np.nan
-    sortino = (ann_mean - rf) / downside_vol if downside_vol and downside_vol > 0 else np.nan
-
-    running_max = equity.cummax()
-    drawdown = equity / running_max - 1
-    max_dd = drawdown.min()
-    calmar = cagr / abs(max_dd) if max_dd != 0 else np.nan
-
-    win_rate = (returns > 0).mean()
-
-    return {
-        "CAGR": cagr, "AnnVol": ann_vol, "Sharpe": sharpe, "Sortino": sortino,
-        "MaxDD": max_dd, "Calmar": calmar, "WinRate": win_rate,
-    }
-
-
-def alpha_beta(strategy_returns, benchmark_returns, freq=TRADING_DAYS):
-    df = pd.concat([strategy_returns, benchmark_returns], axis=1, join="inner").dropna()
-    df.columns = ["strategy", "benchmark"]
-    if len(df) < 2 or df["benchmark"].var() == 0:
-        return np.nan, np.nan, np.nan
-    beta = df["benchmark"].cov(df["strategy"]) / df["benchmark"].var()
-    alpha_daily = df["strategy"].mean() - beta * df["benchmark"].mean()
-    alpha_annual = alpha_daily * freq
-    corr = df["strategy"].corr(df["benchmark"])
-    return alpha_annual, beta, corr
 
 
 # Benchmarks
@@ -134,18 +78,17 @@ def fetch_benchmark(start, end, ticker=BENCHMARK_TICKER):
         return None
 
 
-# Report
+# Single-pair report (unchanged behavior from before)
 
 def build_report(ticker_a=None, ticker_b=None, cost_bps=COST_BPS,
-                  candidates=CANDIDATES):
-
+                  candidates=CANDIDATES, entry_z=DEFAULT_ENTRY_Z, exit_z=DEFAULT_EXIT_Z):
     if ticker_a is None or ticker_b is None:
         ticker_a, ticker_b, _ = select_best_pair(candidates)
 
     data = load_data(ticker_a, ticker_b)
 
     naive_result = run_naive(data, ticker_a, ticker_b)
-    wf_result = run_walk_forward(data, ticker_a, ticker_b)
+    wf_result = run_walk_forward(data, ticker_a, ticker_b, entry_z=entry_z, exit_z=exit_z)
 
     naive_gross, naive_net, naive_trades = to_returns(naive_result, data, ticker_a, ticker_b, cost_bps)
     wf_gross, wf_net, wf_trades = to_returns(wf_result, data, ticker_a, ticker_b, cost_bps)
@@ -184,12 +127,12 @@ def build_report(ticker_a=None, ticker_b=None, cost_bps=COST_BPS,
 
     pd.set_option("display.float_format", lambda x: f"{x:,.4f}")
     print(f"\n=== Performance summary: {ticker_a}/{ticker_b} "
-          f"({eval_start.date()} to {eval_end.date()}, {cost_bps:.1f}bps cost) ===")
+          f"({eval_start.date()} to {eval_end.date()}, {cost_bps:.1f}bps cost, "
+          f"entry_z={entry_z}, exit_z={exit_z}) ===")
     print(summary.to_string())
 
     summary.to_csv(f"data/{ticker_a}_{ticker_b}_performance_summary.csv")
 
-    # Equity curve chart
     fig, ax = plt.subplots(figsize=(10, 6))
     (1 + wf_gross).cumprod().plot(ax=ax, label="Walk-forward (gross)")
     (1 + wf_net).cumprod().plot(ax=ax, label=f"Walk-forward (net, {cost_bps:.0f}bps)")
@@ -206,12 +149,166 @@ def build_report(ticker_a=None, ticker_b=None, cost_bps=COST_BPS,
     return summary
 
 
+# Threshold tuning: grid-search on train, report on held-out test only
+
+def tuned_vs_default_report(ticker_a, ticker_b, cost_bps=COST_BPS,
+                             train_end=DEFAULT_TRAIN_END):
+    """Tune entry/exit thresholds on data up to `train_end`, then compare
+    the tuned thresholds against the original defaults (2.0 / 0.5) on the
+    held-out period AFTER train_end -- so any Sharpe improvement shown here
+    is out-of-sample, not just curve-fit to the whole backtest.
+    """
+    data = load_data(ticker_a, ticker_b)
+
+    best_entry, best_exit, grid = grid_search_thresholds(
+        data, ticker_a, ticker_b, train_end=train_end, cost_bps=cost_bps)
+
+    test_start = data.loc[train_end:].index[1]  # first day after the split
+    test_end = data.index[-1]
+
+    default_result = run_walk_forward(data, ticker_a, ticker_b,
+                                       entry_z=DEFAULT_ENTRY_Z, exit_z=DEFAULT_EXIT_Z)
+    tuned_result = run_walk_forward(data, ticker_a, ticker_b,
+                                     entry_z=best_entry, exit_z=best_exit)
+
+    _, default_net, default_trades = to_returns(
+        default_result.loc[test_start:test_end], data, ticker_a, ticker_b, cost_bps)
+    _, tuned_net, tuned_trades = to_returns(
+        tuned_result.loc[test_start:test_end], data, ticker_a, ticker_b, cost_bps)
+
+    rows = {
+        f"Default thresholds (entry={DEFAULT_ENTRY_Z}, exit={DEFAULT_EXIT_Z})": perf_stats(default_net),
+        f"Tuned thresholds (entry={best_entry}, exit={best_exit})": perf_stats(tuned_net),
+    }
+    summary = pd.DataFrame(rows).T
+    summary["Trades"] = [default_trades, tuned_trades]
+
+    pd.set_option("display.float_format", lambda x: f"{x:,.4f}")
+    print(f"\n=== Threshold tuning: {ticker_a}/{ticker_b} "
+          f"(trained through {train_end}, evaluated out-of-sample "
+          f"{test_start.date()} to {test_end.date()}) ===")
+    print("Top of grid search (ranked by train-period Sharpe):")
+    print(grid.head(5).to_string(index=False))
+    print()
+    print(summary.to_string())
+
+    return best_entry, best_exit, summary
+
+
+# Portfolio report: every cointegrated pair, equal-weighted
+
+def build_portfolio_report(candidates=CANDIDATES, alpha=SIGNIFICANCE, cost_bps=COST_BPS,
+                            tune=False, train_end=DEFAULT_TRAIN_END):
+    """Run the walk-forward strategy on every pair that clears the
+    cointegration screen (not just the single best one) and combine them
+    into an equal-weighted portfolio.
+
+    A single pair's Sharpe is dominated by idiosyncratic noise. Running a
+    basket of cointegrated pairs and equal-weighting them is the standard
+    way a stat arb book raises portfolio-level Sharpe through diversification,
+    without claiming any one pair individually has a bigger edge than it does.
+    """
+    screened = screen(candidates)
+    qualifying = screened[screened["p_value"] < alpha]
+    if qualifying.empty:
+        print(f"[warning] No candidate cleared p < {alpha}; using the single "
+              f"best candidate instead so the portfolio isn't empty.")
+        qualifying = screened.iloc[:1]
+
+    print(f"Pairs entering the portfolio (p < {alpha}):")
+    print(qualifying.to_string(index=False))
+
+    per_pair_returns = {}
+    per_pair_stats = {}
+    pair_data = {}
+    for _, row in qualifying.iterrows():
+        a, b = row["A"], row["B"]
+        data = load_data(a, b)
+        pair_data[(a, b)] = data
+
+        entry_z, exit_z = DEFAULT_ENTRY_Z, DEFAULT_EXIT_Z
+        if tune:
+            entry_z, exit_z, _ = grid_search_thresholds(
+                data, a, b, train_end=train_end, cost_bps=cost_bps)
+
+        result = run_walk_forward(data, a, b, entry_z=entry_z, exit_z=exit_z)
+        _, net_returns, n_trades = to_returns(result, data, a, b, cost_bps)
+        per_pair_returns[f"{a}/{b}"] = net_returns
+        per_pair_stats[f"{a}/{b}"] = {
+            **perf_stats(net_returns), "Trades": n_trades,
+            "entry_z": entry_z, "exit_z": exit_z,
+        }
+
+    returns_df = pd.DataFrame(per_pair_returns)
+    # Equal-weight combine. Days before a pair's own walk-forward warmup ends
+    # are treated as 0 (flat / no position) rather than dropping the row, so
+    # one pair's longer warmup doesn't shrink the whole portfolio's history.
+    portfolio_returns = returns_df.fillna(0).mean(axis=1)
+    portfolio_returns = portfolio_returns.loc[returns_df.dropna(how="all").index]
+
+    per_pair_stats["EQUAL-WEIGHT PORTFOLIO"] = {
+        **perf_stats(portfolio_returns), "Trades": np.nan,
+        "entry_z": np.nan, "exit_z": np.nan,
+    }
+
+    bh_combo = pd.concat(
+        [naive_buy_and_hold(pair_data[(row["A"], row["B"])], row["A"], row["B"])
+         for _, row in qualifying.iterrows()], axis=1
+    ).mean(axis=1)
+    per_pair_stats["50/50 buy & hold, averaged across same pairs"] = {
+        **perf_stats(bh_combo.reindex(portfolio_returns.index)), "Trades": np.nan,
+        "entry_z": np.nan, "exit_z": np.nan,
+    }
+
+    summary = pd.DataFrame(per_pair_stats).T
+    pd.set_option("display.float_format", lambda x: f"{x:,.4f}")
+    print(f"\n=== Portfolio performance across {len(qualifying)} cointegrated pair(s) "
+          f"({cost_bps:.1f}bps cost, thresholds {'tuned per-pair' if tune else 'default'}) ===")
+    print(summary.to_string())
+
+    summary.to_csv("data/portfolio_performance_summary.csv")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for name, r in per_pair_returns.items():
+        (1 + r.fillna(0)).cumprod().plot(ax=ax, alpha=0.4, label=name)
+    (1 + portfolio_returns).cumprod().plot(ax=ax, color="black", linewidth=2.5,
+                                            label="Equal-weight portfolio")
+    ax.set_title("Per-pair strategies vs. equal-weighted portfolio (growth of $1)")
+    ax.set_ylabel("Growth of $1")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig("data/portfolio_equity_curve.png")
+    plt.close(fig)
+
+    return summary
+
+
 if __name__ == "__main__":
-    # Default: screen CANDIDATES and backtest whichever pair wins.
-    #   python backtest_report.py
-    # Override: force a specific pair and skip screening entirely.
-    #   python backtest_report.py V MA
-    if len(sys.argv) == 3:
-        build_report(sys.argv[1], sys.argv[2])
+    parser = argparse.ArgumentParser(description="Pairs trading backtest report.")
+    parser.add_argument("pair", nargs="*", help="Optional explicit pair, e.g. V MA")
+    parser.add_argument("--tune", action="store_true",
+                         help="Grid-search entry/exit thresholds on a train split, "
+                              "then report performance out-of-sample using the tuned thresholds.")
+    parser.add_argument("--portfolio", action="store_true",
+                         help="Backtest every pair that clears the cointegration screen "
+                              "and report an equal-weighted portfolio, instead of one pair.")
+    parser.add_argument("--train-end", default=DEFAULT_TRAIN_END,
+                         help=f"Date splitting train (tuning) from test (reporting) data. "
+                              f"Default {DEFAULT_TRAIN_END}.")
+    args = parser.parse_args()
+
+    if args.portfolio:
+        build_portfolio_report(tune=args.tune, train_end=args.train_end)
+    elif args.tune:
+        if len(args.pair) == 2:
+            ticker_a, ticker_b = args.pair
+        else:
+            ticker_a, ticker_b, _ = select_best_pair()
+        best_entry, best_exit, _ = tuned_vs_default_report(
+            ticker_a, ticker_b, train_end=args.train_end)
+        # Also print the standard full-history report, using the tuned thresholds.
+        build_report(ticker_a, ticker_b, entry_z=best_entry, exit_z=best_exit)
+    elif len(args.pair) == 2:
+        build_report(args.pair[0], args.pair[1])
     else:
         build_report()

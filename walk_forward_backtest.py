@@ -2,14 +2,17 @@ import pandas as pd
 
 from pull_data import TICKER_A, TICKER_B, load_data
 from cointegration_test import compute_hedge_ratio
+from performance import to_returns, perf_stats, COST_BPS
 
 
 def run_walk_forward(data, ticker_a=TICKER_A, ticker_b=TICKER_B,
                       lookback=252, refit_every=63,
                       window=60, entry_z=2.0, exit_z=0.5):
-    """
+    """Walk-forward pairs backtest.
+
     The hedge ratio is re-estimated every `refit_every` days using only the
-    trailing `lookback` days of data, then applied forward-only
+    trailing `lookback` days of data, then applied forward-only — this is
+    the fix for the look-ahead bias baked into native_backtest.py.
     """
     n = len(data)
 
@@ -53,6 +56,42 @@ def run_walk_forward(data, ticker_a=TICKER_A, ticker_b=TICKER_B,
         "pnl": pnl,
         "cumulative_pnl": pnl.cumsum(),
     })
+
+
+def grid_search_thresholds(data, ticker_a=TICKER_A, ticker_b=TICKER_B,
+                            train_end=None,
+                            entry_grid=(1.5, 2.0, 2.5, 3.0),
+                            exit_grid=(0.0, 0.25, 0.5, 0.75),
+                            lookback=252, refit_every=63, window=60,
+                            cost_bps=COST_BPS, metric="Sharpe"):
+    """Grid-search entry/exit z-score thresholds on an IN-SAMPLE (train) split.
+
+    Returns (best_entry_z, best_exit_z, grid_results_df) where grid_results_df
+    is sorted best-first by `metric`
+    """
+    train = data if train_end is None else data.loc[:train_end]
+
+    rows = []
+    for entry_z in entry_grid:
+        for exit_z in exit_grid:
+            if exit_z >= entry_z:
+                continue  # exit must be tighter than entry or a position never closes
+            result = run_walk_forward(train, ticker_a, ticker_b,
+                                       lookback=lookback, refit_every=refit_every,
+                                       window=window, entry_z=entry_z, exit_z=exit_z)
+            if result.empty:
+                continue
+            _, net_returns, n_trades = to_returns(result, train, ticker_a, ticker_b, cost_bps)
+            stats = perf_stats(net_returns)
+            stats.update({"entry_z": entry_z, "exit_z": exit_z, "Trades": n_trades})
+            rows.append(stats)
+
+    grid = pd.DataFrame(rows)
+    if grid.empty:
+        return 2.0, 0.5, grid  # fall back to the original defaults
+    grid = grid.sort_values(metric, ascending=False).reset_index(drop=True)
+    best = grid.iloc[0]
+    return best["entry_z"], best["exit_z"], grid
 
 
 if __name__ == "__main__":
